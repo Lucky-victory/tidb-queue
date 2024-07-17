@@ -3,7 +3,6 @@ import * as mysql from "mysql2/promise";
 import { fork, ChildProcess } from "child_process";
 import { CronJob } from "cron";
 import * as winston from "winston";
-import * as path from "path";
 import { v4 as uuid } from "uuid";
 import isEmpty from "just-is-empty";
 
@@ -51,7 +50,7 @@ export interface JobOptions {
   /**
    * the delay before the next retry in this format 1s, 2m, 1h
    */
-  retryDelay?: string;
+  retryInterval?: string;
 
   /**
    * The cron expression for scheduling the job, e.g. "0 0 * * *" for every midnight
@@ -59,7 +58,7 @@ export interface JobOptions {
   cron?: string;
 }
 
-export interface JobQueueOptions {
+export interface QueueOptions {
   /**
    * How frequently should the jobs be checked
    */
@@ -94,7 +93,7 @@ export interface JobQueueOptions {
   };
 }
 
-export class JobQueue extends EventEmitter {
+export class TiDBQueue extends EventEmitter {
   private pool: mysql.Pool;
   private pollingInterval: number;
   private concurrency: number;
@@ -108,7 +107,7 @@ export class JobQueue extends EventEmitter {
   private workerFile?: string;
   private pollIntervalId?: NodeJS.Timeout;
 
-  constructor(dbConfig: mysql.PoolOptions, options: JobQueueOptions = {}) {
+  constructor(dbConfig: mysql.PoolOptions, options: QueueOptions = {}) {
     super();
     this.pool = mysql.createPool(dbConfig);
     this.pollingInterval = this.parseTime(options.pollingInterval || "5s");
@@ -168,17 +167,19 @@ export class JobQueue extends EventEmitter {
         jobId CHAR(36) DEFAULT UUID(),
         payload JSON,
         status ENUM('queued', 'processing', 'completed', 'failed') DEFAULT 'queued',
-        run_at TIMESTAMP NOT NULL,
+        runAt TIMESTAMP NOT NULL,
+        retryOnFail BOOLEAN DEFAULT FALSE,
+        retryInterval VARCHAR(10) DEFAULT 1m,
         priority INT DEFAULT 0,
         attempts INT DEFAULT 0,
-        max_attempts INT DEFAULT 3,
+        maxAttempts INT DEFAULT 3,
         cron VARCHAR(100),
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
       )
     `);
     await this.pool.query(
-      "CREATE INDEX IF NOT EXISTS idx_status_run_at_priority_job_id ON jobs (status, run_at, priority,jobId)"
+      "CREATE INDEX IF NOT EXISTS idx_status_runAt_priority_job_id ON jobs (status, runAt, priority,jobId)"
     );
   }
 
@@ -197,10 +198,12 @@ export class JobQueue extends EventEmitter {
       maxAttempts = 3,
       cron,
       jobId: customJobId,
+      retryInterval = "1m",
+      retryOnFail = false,
     } = options;
     const runAt = new Date(Date.now() + this.parseTime(delay));
     const [result] = await this.pool.query<mysql.ResultSetHeader>(
-      "INSERT INTO jobs (jobId,type, payload, run_at, priority, max_attempts, cron) VALUES (?,?, ?, ?, ?, ?, ?)",
+      "INSERT INTO jobs (jobId,type, payload, runAt, priority, maxAttempts, retryInterval,retryOnFail,cron) VALUES (?,?, ?, ?, ?, ?, ?,?,?)",
       [
         !isEmpty(customJobId) ? customJobId : uuid(),
         type,
@@ -208,6 +211,8 @@ export class JobQueue extends EventEmitter {
         runAt,
         priority,
         maxAttempts,
+        retryInterval,
+        retryOnFail,
         cron,
       ]
     );
@@ -235,7 +240,7 @@ export class JobQueue extends EventEmitter {
    */
   private async triggerCronJob(jobId: number): Promise<void> {
     await this.pool.query(
-      'UPDATE jobs SET run_at = NOW(), attempts = 0 WHERE id = ? AND status != "processing"',
+      'UPDATE jobs SET runAt = NOW(), attempts = 0 WHERE id = ? AND status != "processing"',
       [jobId]
     );
   }
@@ -303,8 +308,8 @@ export class JobQueue extends EventEmitter {
       const [_jobs] = await connection.query(
         `
         SELECT * FROM jobs 
-        WHERE status = 'queued' AND run_at <= NOW()
-        ORDER BY priority DESC, run_at
+        WHERE status = 'queued' AND runAt <= NOW()
+        ORDER BY priority DESC, runAt
         LIMIT ?
         FOR UPDATE SKIP LOCKED
       `,
@@ -322,7 +327,7 @@ export class JobQueue extends EventEmitter {
 
       for (const job of jobs) {
         this.activeJobs++;
-        this.emit("jobStart", job);
+        this.emit("start", job);
         this.log("info", `Starting job ${job.jobId} of type ${job.type}`);
         this.processJob(job);
       }
@@ -455,7 +460,7 @@ export class JobQueue extends EventEmitter {
         Date.now() + this.parseTime(job.retryInterval)
       );
       await this.pool.query(
-        'UPDATE jobs SET status = "queued", run_at = ? WHERE id = ?',
+        'UPDATE jobs SET status = "queued", runAt = ? WHERE id = ?',
         [nextRunAt, job.id]
       );
       this.log("info", `Scheduling retry for job ${job.jobId}`);
@@ -490,7 +495,7 @@ export class JobQueue extends EventEmitter {
    */
   async retryJob(jobId: number): Promise<boolean> {
     const [result] = await this.pool.query<mysql.ResultSetHeader>(
-      'UPDATE jobs SET status = "queued", attempts = 0, run_at = NOW() WHERE id = ? AND status = "failed"',
+      'UPDATE jobs SET status = "queued", attempts = 0, runAt = NOW() WHERE id = ? AND status = "failed"',
       [jobId]
     );
     return result.affectedRows > 0;
@@ -558,4 +563,4 @@ export class JobQueue extends EventEmitter {
   }
 }
 
-export default JobQueue;
+export default TiDBQueue;
