@@ -1,3 +1,4 @@
+import ms from "ms";
 import { EventEmitter } from "events";
 import * as mysql from "mysql2/promise";
 import { fork, ChildProcess } from "child_process";
@@ -8,23 +9,19 @@ import isEmpty from "just-is-empty";
 
 export interface Job<P = any> {
   id: number;
-  type: string;
+  queueName: string;
   payload: P;
   status: "queued" | "processing" | "completed" | "failed";
   runAt: Date;
   priority: number;
   attempts: number;
-
   jobId: string;
-
   delay: string;
-
   maxAttempts: number;
-
   retryOnFail: boolean;
-
-  retryInterval: string;
-
+  retryOnFailInterval: string;
+  maxRetryOnFailAttempts: number;
+  retryOnFailAttempts: number;
   cron: string;
 }
 
@@ -48,9 +45,13 @@ export interface JobOptions {
    */
   retryOnFail?: boolean;
   /**
-   * the delay before the next retry in this format 1s, 2m, 1h
+   * The maximum number of retry attempts when the job fails, default is 3
    */
-  retryInterval?: string;
+  maxRetryOnFailAttempts?: number;
+  /**
+   * The interval between retry attempts when the job fails, default is 1m
+   */
+  retryOnFailInterval?: string;
 
   /**
    * The cron expression for scheduling the job, e.g. "0 0 * * *" for every midnight
@@ -60,19 +61,19 @@ export interface JobOptions {
 
 export interface QueueOptions {
   /**
-   * How frequently should the jobs be checked
+   * How frequently should the jobs be checked,  (default is 5s)
    */
   pollingInterval?: string;
   /**
-   * How many concurrent jobs to run at once, default is 5
+   * How many concurrent jobs to run at once,(default is 5)
    */
   concurrency?: number;
   /**
-   * Whether to automatically start the job queue, default is true
+   * Whether to automatically start the job queue, (default is true)
    */
   autoStart?: boolean;
   /**
-   * Whether to use a separate process for running jobs, default is false
+   * Whether to use a separate process for running jobs, (default is false)
    */
   useSeparateProcess?: boolean;
   /**
@@ -92,8 +93,7 @@ export interface QueueOptions {
     filename?: string;
   };
 }
-
-export class TiDBQueue extends EventEmitter {
+export class TiQueue extends EventEmitter {
   private pool: mysql.Pool;
   private pollingInterval: number;
   private concurrency: number;
@@ -106,16 +106,24 @@ export class TiDBQueue extends EventEmitter {
   private useSeparateProcess: boolean;
   private workerFile?: string;
   private pollIntervalId?: NodeJS.Timeout;
+  private queueName: string;
+  private jobHandlers: Map<string, (job: Job) => Promise<any>> = new Map();
 
-  constructor(dbConfig: mysql.PoolOptions, options: QueueOptions = {}) {
+  constructor(
+    queueName: string,
+    dbConfigOrPool: mysql.PoolOptions | mysql.Pool,
+    options: QueueOptions = {}
+  ) {
     super();
-    this.pool = mysql.createPool(dbConfig);
+    this.queueName = queueName;
+    this.pool = this.isMySQLPool(dbConfigOrPool)
+      ? (dbConfigOrPool as mysql.Pool)
+      : mysql.createPool(dbConfigOrPool);
     this.pollingInterval = this.parseTime(options.pollingInterval || "5s");
     this.concurrency = options.concurrency || 5;
     this.useSeparateProcess = options.useSeparateProcess || false;
     this.workerFile = options.workerFile;
 
-    // Setup logging if enabled
     if (options.logging && options.logging.enabled) {
       this.logger = winston.createLogger({
         level: options.logging.level || "info",
@@ -129,68 +137,54 @@ export class TiDBQueue extends EventEmitter {
       });
     }
 
-    // Call init in constructor
     this.initPromise = this.init();
 
     if (options.autoStart) {
       this.initPromise.then(() => this.start());
     }
   }
-
+  private isMySQLPool(obj: any) {
+    return (
+      obj &&
+      typeof obj === "object" &&
+      typeof obj.getConnection === "function" &&
+      typeof obj.query === "function" &&
+      typeof obj.end === "function"
+    );
+  }
   private parseTime(time: string): number {
-    const secs = 1000;
-    const units: { [key: string]: number } = {
-      s: secs,
-      m: secs * 60,
-      h: secs * 60 * 60,
-      d: secs * 60 * 60 * 24,
-    };
-    const match = time.match(/^(\d+)([smhd])$/);
-    if (!match)
-      throw new Error(
-        "Invalid time format. Use <number><unit>, e.g., 30s, 5m, 2h, 1d"
-      );
-    return parseInt(match[1]) * units[match[2]];
+    return ms(time);
   }
 
   private initPromise: Promise<void>;
 
-  /**
-   * Initialize the job queue by creating necessary database tables
-   */
-
-  private async init(): Promise<void> {
+  async init(): Promise<void> {
     await this.pool.query(`
       CREATE TABLE IF NOT EXISTS jobs (
         id INT AUTO_INCREMENT PRIMARY KEY,
-        type VARCHAR(50) NOT NULL,
+        queueName VARCHAR(50) NOT NULL,
         jobId CHAR(36) DEFAULT UUID(),
         payload JSON,
         status ENUM('queued', 'processing', 'completed', 'failed') DEFAULT 'queued',
         runAt TIMESTAMP NOT NULL,
         retryOnFail BOOLEAN DEFAULT FALSE,
-        retryInterval VARCHAR(10) DEFAULT 1m,
+        retryOnFailInterval VARCHAR(10) DEFAULT '1m',
         priority INT DEFAULT 0,
         attempts INT DEFAULT 0,
         maxAttempts INT DEFAULT 3,
+        maxRetryOnFailAttempts INT DEFAULT 3,
+        retryOnFailAttempts INT DEFAULT 0,
         cron VARCHAR(100),
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
       )
     `);
     await this.pool.query(
-      "CREATE INDEX IF NOT EXISTS idx_status_runAt_priority_job_id ON jobs (status, runAt, priority,jobId)"
+      "CREATE INDEX IF NOT EXISTS idx_queueName_status_runAt_priority_job_id ON jobs (queueName, status, runAt, priority, jobId)"
     );
   }
 
-  /**
-   * Add a new job to the queue
-   */
-  async addJob(
-    type: string,
-    payload: any,
-    options: JobOptions = {}
-  ): Promise<number> {
+  async add(payload: any, options: JobOptions = {}): Promise<number> {
     await this.initPromise;
     const {
       delay = "0s",
@@ -198,21 +192,23 @@ export class TiDBQueue extends EventEmitter {
       maxAttempts = 3,
       cron,
       jobId: customJobId,
-      retryInterval = "1m",
+      retryOnFailInterval = "1m",
       retryOnFail = false,
+      maxRetryOnFailAttempts = 3,
     } = options;
     const runAt = new Date(Date.now() + this.parseTime(delay));
     const [result] = await this.pool.query<mysql.ResultSetHeader>(
-      "INSERT INTO jobs (jobId,type, payload, runAt, priority, maxAttempts, retryInterval,retryOnFail,cron) VALUES (?,?, ?, ?, ?, ?, ?,?,?)",
+      "INSERT INTO jobs (queueName, jobId, payload, runAt, priority, maxAttempts, retryOnFailInterval, retryOnFail,maxRetryOnFailAttempts, cron) VALUES (?, ?,?, ?, ?, ?, ?, ?, ?, ?)",
       [
+        this.queueName,
         !isEmpty(customJobId) ? customJobId : uuid(),
-        type,
         JSON.stringify(payload),
         runAt,
         priority,
         maxAttempts,
-        retryInterval,
+        retryOnFailInterval,
         retryOnFail,
+        maxRetryOnFailAttempts,
         cron,
       ]
     );
@@ -227,27 +223,21 @@ export class TiDBQueue extends EventEmitter {
   }
 
   /**
-   * Setup a cron job for repeated execution
+   * Alias for add method
    */
-  private setupCronJob(jobId: number, cronExpression: string): void {
-    const job = new CronJob(cronExpression, () => this.triggerCronJob(jobId));
-    this.cronJobs.set(jobId, job);
-    job.start();
+  async addJob(payload: any, options: JobOptions = {}): Promise<number> {
+    return this.add(payload, options);
   }
 
-  /**
-   * Trigger a cron job by resetting its run time
-   */
-  private async triggerCronJob(jobId: number): Promise<void> {
-    await this.pool.query(
-      'UPDATE jobs SET runAt = NOW(), attempts = 0 WHERE id = ? AND status != "processing"',
-      [jobId]
-    );
+  handler(fn: (job: Job) => Promise<any>): void {
+    if (this.jobHandlers.has(this.queueName)) {
+      this.log(
+        "warn",
+        `Handler for queue ${this.queueName} is being overwritten`
+      );
+    }
+    this.jobHandlers.set(this.queueName, fn);
   }
-
-  /**
-   * Start the job queue
-   */
   start(): void {
     if (this.isRunning) return;
     this.isRunning = true;
@@ -256,18 +246,17 @@ export class TiDBQueue extends EventEmitter {
       () => this.processJobs(),
       this.pollingInterval
     );
+
     this.emit("start");
     this.log("info", "Job queue started");
   }
 
-  /**
-   * Stop the job queue
-   */
   stop(): void {
     if (!this.isRunning) return;
     this.isRunning = false;
     if (this.pollIntervalId) {
       clearInterval(this.pollIntervalId);
+      this.pollIntervalId = undefined;
     }
     this.cronJobs.forEach((job) => job.stop());
     this.cronJobs.clear();
@@ -277,27 +266,18 @@ export class TiDBQueue extends EventEmitter {
     this.log("info", "Job queue stopped");
   }
 
-  /**
-   * Pause the job queue
-   */
   pause(): void {
     this.isPaused = true;
     this.emit("pause");
     this.log("info", "Job queue paused");
   }
 
-  /**
-   * Resume the job queue
-   */
   resume(): void {
     this.isPaused = false;
     this.emit("resume");
     this.log("info", "Job queue resumed");
   }
 
-  /**
-   * Process queued jobs
-   */
   private async processJobs(): Promise<void> {
     if (this.isPaused || this.activeJobs >= this.concurrency) return;
 
@@ -308,12 +288,12 @@ export class TiDBQueue extends EventEmitter {
       const [_jobs] = await connection.query(
         `
         SELECT * FROM jobs 
-        WHERE status = 'queued' AND runAt <= NOW()
+        WHERE queueName = ? AND status = 'queued' AND runAt <= NOW()
         ORDER BY priority DESC, runAt
         LIMIT ?
         FOR UPDATE SKIP LOCKED
       `,
-        [this.concurrency - this.activeJobs]
+        [this.queueName, this.concurrency - this.activeJobs]
       );
       const jobs = _jobs as Job[];
       for (const job of jobs) {
@@ -328,7 +308,10 @@ export class TiDBQueue extends EventEmitter {
       for (const job of jobs) {
         this.activeJobs++;
         this.emit("start", job);
-        this.log("info", `Starting job ${job.jobId} of type ${job.type}`);
+        this.log(
+          "info",
+          `Starting job ${job.jobId} in queue ${this.queueName}`
+        );
         this.processJob(job);
       }
     } catch (error) {
@@ -340,9 +323,6 @@ export class TiDBQueue extends EventEmitter {
     }
   }
 
-  /**
-   * Process a single job
-   */
   private processJob(job: Job): void {
     if (this.useSeparateProcess) {
       this.processJobInSeparateProcess(job);
@@ -351,15 +331,34 @@ export class TiDBQueue extends EventEmitter {
     }
   }
 
-  /**
-   * Process a job in a separate process
-   */
+  private async processJobInline(job: Job): Promise<void> {
+    try {
+      const handler = this.jobHandlers.get(this.queueName);
+      if (!handler) {
+        throw new Error(`No handler registered for queue ${this.queueName}`);
+      }
+      const result = await handler(job);
+      await this.completeJob(job, result);
+    } catch (error) {
+      await this.handleFailedJob(job, error as Error);
+    } finally {
+      this.activeJobs--;
+    }
+  }
+
   private processJobInSeparateProcess(job: Job): void {
     if (!this.workerFile) {
       throw new Error("Worker file path not specified");
     }
     const worker = fork(this.workerFile);
     this.workers.push(worker);
+
+    const cleanupWorker = () => {
+      const index = this.workers.indexOf(worker);
+      if (index > -1) {
+        this.workers.splice(index, 1);
+      }
+    };
 
     worker.on(
       "message",
@@ -379,10 +378,7 @@ export class TiDBQueue extends EventEmitter {
           this.emit("error", error);
         } finally {
           this.activeJobs--;
-          const index = this.workers.indexOf(worker);
-          if (index > -1) {
-            this.workers.splice(index, 1);
-          }
+          cleanupWorker();
           worker.kill();
         }
       }
@@ -391,6 +387,7 @@ export class TiDBQueue extends EventEmitter {
     worker.on("error", (error) => {
       this.log("error", `Worker error for job ${job.jobId}:`, error);
       this.emit("error", error);
+      cleanupWorker();
     });
 
     worker.on("exit", (code) => {
@@ -400,125 +397,112 @@ export class TiDBQueue extends EventEmitter {
           `Worker for job ${job.jobId} exited with code ${code}`
         );
       }
+      cleanupWorker();
     });
 
     worker.send(job);
   }
 
-  /**
-   * Process a job inline (in the same process)
-   */
-  private async processJobInline(job: Job): Promise<void> {
-    try {
-      const result = await this.executeJob(job);
-      await this.completeJob(job, result);
-    } catch (error) {
-      await this.handleFailedJob(job, error as Error);
-    } finally {
-      this.activeJobs--;
-    }
-  }
-
-  /**
-   * Execute a job (to be implemented by the user)
-   * The return value is optional and can be used for complex workflows or logging
-   */
-  async executeJob(job: Job): Promise<any> {
-    // This method should be overridden by the user
-    throw new Error("executeJob method not implemented");
-  }
-
-  /**
-   * Complete a job
-   */
   private async completeJob(job: Job, result: any): Promise<void> {
     await this.pool.query('UPDATE jobs SET status = "completed" WHERE id = ?', [
       job.id,
     ]);
+    job.status = "completed";
     this.log("info", `Job ${job.jobId} completed successfully`);
     this.emit("completed", job, result);
   }
 
-  /**
-   * Handle a failed job
-   */
   private async handleFailedJob(job: Job, error: Error): Promise<void> {
-    if (job.attempts >= job.maxAttempts) {
-      await this.pool.query('UPDATE jobs SET status = "failed" WHERE id = ?', [
-        job.id,
-      ]);
-      this.log(
-        "warn",
-        `Job ${job.jobId} failed after ${job.attempts} attempts`
-      );
-      this.emit("failed", job, error);
-    } else if (job.attempts >= job.maxAttempts && job.retryOnFail) {
-      await this.retryJob(job.id);
-      this.emit("retry", job, error);
-    } else {
-      const nextRunAt = new Date(
-        Date.now() + this.parseTime(job.retryInterval)
-      );
-      await this.pool.query(
-        'UPDATE jobs SET status = "queued", runAt = ? WHERE id = ?',
-        [nextRunAt, job.id]
-      );
-      this.log("info", `Scheduling retry for job ${job.jobId}`);
-      this.emit("retry", job, error);
+    try {
+      if (job.attempts >= job.maxAttempts) {
+        if (
+          job.retryOnFail &&
+          job.retryOnFailAttempts < job.maxRetryOnFailAttempts
+        ) {
+          // Job has exhausted its initial attempts, but can still be retried
+          const nextRetryAt = new Date(
+            Date.now() + this.parseTime(job.retryOnFailInterval)
+          );
+          await this.pool.query(
+            'UPDATE jobs SET status = "queued", attempts = 0, runAt = ?, retryOnFailAttempts = retryOnFailAttempts + 1 WHERE id = ?',
+            [nextRetryAt, job.id]
+          );
+          this.log(
+            "info",
+            `Job ${job.jobId} failed and scheduled for retry at ${nextRetryAt}`
+          );
+          this.emit("retry", job, error);
+        } else {
+          // Job has exhausted all attempts and retries
+          await this.pool.query(
+            'UPDATE jobs SET status = "failed" WHERE id = ?',
+            [job.id]
+          );
+          this.log(
+            "warn",
+            `Job ${job.jobId} failed after ${job.attempts} attempts and ${job.retryOnFailAttempts} retries`
+          );
+          this.emit("failed", job, error);
+        }
+      } else {
+        // Job has not exhausted its initial attempts, reschedule it
+        await this.pool.query(
+          'UPDATE jobs SET status = "queued", runAt = NOW() + INTERVAL ? SECOND WHERE id = ?',
+          [this.parseTime(job.retryOnFailInterval) / 1000, job.id]
+        );
+        this.log("info", `Job ${job.jobId} failed and rescheduled for retry`);
+        this.emit("retry", job, error);
+      }
+    } catch (err) {
+      this.log("error", `Error handling failed job ${job.jobId}:`, err);
+      this.emit("error", err);
     }
   }
-
-  /**
-   * Get the status of a job
-   */
   async getJobStatus(jobId: number): Promise<Job | null> {
-    const [_jobs] = await this.pool.query("SELECT * FROM jobs WHERE id = ?", [
-      jobId,
-    ]);
+    const [_jobs] = await this.pool.query(
+      "SELECT * FROM jobs WHERE id = ? AND queueName = ?",
+      [jobId, this.queueName]
+    );
     const jobs = _jobs as Job[];
     return jobs[0] || null;
   }
 
-  /**
-   * Cancel a job
-   */
   async cancelJob(jobId: number): Promise<boolean> {
     const [result] = await this.pool.query<mysql.ResultSetHeader>(
-      'UPDATE jobs SET status = "failed" WHERE id = ? AND status IN ("queued", "processing")',
-      [jobId]
+      'UPDATE jobs SET status = "failed" WHERE id = ? AND queueName = ? AND status IN ("queued", "processing")',
+      [jobId, this.queueName]
     );
     return result.affectedRows > 0;
   }
 
-  /**
-   * Retry a failed job
-   */
   async retryJob(jobId: number): Promise<boolean> {
     const [result] = await this.pool.query<mysql.ResultSetHeader>(
-      'UPDATE jobs SET status = "queued", attempts = 0, runAt = NOW() WHERE id = ? AND status = "failed"',
-      [jobId]
+      'UPDATE jobs SET status = "queued", attempts = 0, runAt = NOW() WHERE id = ? AND queueName = ? AND status = "failed"',
+      [jobId, this.queueName]
     );
     return result.affectedRows > 0;
   }
 
-  /**
-   * Get queue statistics
-   */
   async getQueueStats(): Promise<{
     queued: number;
     processing: number;
     completed: number;
     failed: number;
   }> {
-    const [_rows] = await this.pool.query(`
+    const [_rows] = await this.pool.query(
+      `
       SELECT status, COUNT(*) as count
       FROM jobs
+      WHERE queueName = ?
       GROUP BY status
-    `);
+    `,
+      [this.queueName]
+    );
     const rows = _rows as {
       status: "queued" | "completed" | "processing" | "failed";
       count: number;
     }[];
+
     const stats = { queued: 0, processing: 0, completed: 0, failed: 0 };
     rows.forEach((row) => {
       stats[row.status as keyof typeof stats] = row.count;
@@ -527,9 +511,6 @@ export class TiDBQueue extends EventEmitter {
     return stats;
   }
 
-  /**
-   * Clean up old jobs
-   */
   async cleanup(daysToKeep: number = 30): Promise<void> {
     const cutoffDate = new Date();
     cutoffDate.setDate(cutoffDate.getDate() - daysToKeep);
@@ -537,30 +518,38 @@ export class TiDBQueue extends EventEmitter {
     await this.pool.query(
       `
       DELETE FROM jobs 
-      WHERE (status = 'completed' OR status = 'failed') 
+      WHERE queueName = ?
+      AND (status = 'completed' OR status = 'failed') 
       AND updated_at < ?
       AND cron IS NULL
     `,
-      [cutoffDate]
+      [this.queueName, cutoffDate]
     );
   }
 
-  /**
-   * Log a message if logging is enabled
-   */
   private log(level: string, message: string, meta?: any): void {
     if (this.logger) {
       this.logger.log(level, message, meta);
     }
   }
 
-  /**
-   * Clean up resources when shutting down
-   */
+  private setupCronJob(jobId: number, cronExpression: string): void {
+    const job = new CronJob(cronExpression, () => this.triggerCronJob(jobId));
+    this.cronJobs.set(jobId, job);
+    job.start();
+  }
+
+  private async triggerCronJob(jobId: number): Promise<void> {
+    await this.pool.query(
+      'UPDATE jobs SET runAt = NOW(), attempts = 0 WHERE id = ? AND queueName = ? AND status != "processing"',
+      [jobId, this.queueName]
+    );
+  }
+
   async shutdown(): Promise<void> {
     this.stop();
     await this.pool.end();
   }
 }
 
-export default TiDBQueue;
+export default TiQueue;
