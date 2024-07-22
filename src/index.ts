@@ -10,7 +10,7 @@ import isEmpty from "just-is-empty";
 export interface Job<P = any> {
   id: number;
   queueName: string;
-  payload: P;
+  payload: P | null;
   status: "queued" | "processing" | "completed" | "failed";
   runAt: Date;
   priority: number;
@@ -49,7 +49,7 @@ export interface JobOptions {
    */
   maxRetryOnFailAttempts?: number;
   /**
-   * The interval between retry attempts when the job fails, default is 1m
+   * The interval between retry attempts when the job fails, default is 5s
    */
   retryOnFailInterval?: string;
 
@@ -97,8 +97,10 @@ export class TiQueue extends EventEmitter {
   private pool: mysql.Pool;
   private pollingInterval: number;
   private concurrency: number;
-  private isRunning: boolean = false;
+  public isRunning:boolean = false;
+  private _isRunning: boolean = false;
   private isPaused: boolean = false;
+  private isShuttingDown: boolean = false;
   private activeJobs: number = 0;
   private cronJobs: Map<number, CronJob> = new Map();
   private workers: ChildProcess[] = [];
@@ -108,7 +110,7 @@ export class TiQueue extends EventEmitter {
   private pollIntervalId?: NodeJS.Timeout;
   private queueName: string;
   private jobHandlers: Map<string, (job: Job) => Promise<any>> = new Map();
-
+  private initPromise: Promise<void>;
   constructor(
     queueName: string,
     dbConfigOrPool: mysql.PoolOptions | mysql.Pool,
@@ -131,17 +133,29 @@ export class TiQueue extends EventEmitter {
         transports: [
           new winston.transports.Console(),
           new winston.transports.File({
-            filename: options.logging.filename || "job_queue.log",
+            filename: options.logging.filename || `${this.queueName}.log`,
           }),
         ],
       });
     }
 
-    this.initPromise = this.init();
+    this.initPromise = (async () => await this.init())();
 
     if (options.autoStart) {
       this.initPromise.then(() => this.start());
     }
+
+    // Set up signal handlers for graceful shutdown
+    process.on("SIGINT", this.handleShutdownSignal.bind(this));
+    process.on("SIGTERM", this.handleShutdownSignal.bind(this));
+  }
+  private set queueStatus({isRunning,isPaused}:{isRunning:boolean,isPaused:boolean}){
+
+    this.emit("statusChange", {isRunning,isPaused});
+
+  }
+  get queueStatus(){
+    return {isRunning: this._isRunning, isPaused: this.isPaused};
   }
   private isMySQLPool(obj: any) {
     return (
@@ -156,10 +170,9 @@ export class TiQueue extends EventEmitter {
     return ms(time);
   }
 
-  private initPromise: Promise<void>;
-
   async init(): Promise<void> {
-    await this.pool.query(`
+    try {
+      await this.pool.query(`
       CREATE TABLE IF NOT EXISTS jobs (
         id INT AUTO_INCREMENT PRIMARY KEY,
         queueName VARCHAR(50) NOT NULL,
@@ -167,21 +180,26 @@ export class TiQueue extends EventEmitter {
         payload JSON,
         status ENUM('queued', 'processing', 'completed', 'failed') DEFAULT 'queued',
         runAt TIMESTAMP NOT NULL,
-        retryOnFail BOOLEAN DEFAULT FALSE,
-        retryOnFailInterval VARCHAR(10) DEFAULT '1m',
         priority INT DEFAULT 0,
         attempts INT DEFAULT 0,
         maxAttempts INT DEFAULT 3,
+        retryOnFail BOOLEAN DEFAULT FALSE,
         maxRetryOnFailAttempts INT DEFAULT 3,
         retryOnFailAttempts INT DEFAULT 0,
+        retryOnFailInterval VARCHAR(10) DEFAULT '5s',
         cron VARCHAR(100),
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+        createdAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updatedAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
       )
     `);
-    await this.pool.query(
-      "CREATE INDEX IF NOT EXISTS idx_queueName_status_runAt_priority_job_id ON jobs (queueName, status, runAt, priority, jobId)"
-    );
+      await this.pool.query(
+        "CREATE INDEX IF NOT EXISTS idx_queueName_status_runAt_priority_job_id ON jobs (queueName, status, runAt, priority, jobId)"
+      );
+      this.emit("queue_init");
+    } catch (error) {
+      this.log("error", "Error initializing queue: " + this.queueName);
+      console.error("Error initializing the database:", error);
+    }
   }
 
   async add(payload: any, options: JobOptions = {}): Promise<number> {
@@ -192,7 +210,7 @@ export class TiQueue extends EventEmitter {
       maxAttempts = 3,
       cron,
       jobId: customJobId,
-      retryOnFailInterval = "1m",
+      retryOnFailInterval = "5s",
       retryOnFail = false,
       maxRetryOnFailAttempts = 3,
     } = options;
@@ -239,21 +257,22 @@ export class TiQueue extends EventEmitter {
     this.jobHandlers.set(this.queueName, fn);
   }
   start(): void {
-    if (this.isRunning) return;
-    this.isRunning = true;
+    if (this._isRunning) return;
+    this._isRunning = true;
     this.isPaused = false;
+    if (this.pollIntervalId) clearInterval(this.pollIntervalId);
     this.pollIntervalId = setInterval(
       () => this.processJobs(),
       this.pollingInterval
     );
 
-    this.emit("start");
+    this.emit("queue_start");
     this.log("info", "Job queue started");
   }
 
   stop(): void {
-    if (!this.isRunning) return;
-    this.isRunning = false;
+    if (!this._isRunning) return;
+    this._isRunning = false;
     if (this.pollIntervalId) {
       clearInterval(this.pollIntervalId);
       this.pollIntervalId = undefined;
@@ -262,24 +281,28 @@ export class TiQueue extends EventEmitter {
     this.cronJobs.clear();
     this.workers.forEach((worker) => worker.kill());
     this.workers = [];
-    this.emit("stop");
+    this.emit("queue_stop");
     this.log("info", "Job queue stopped");
   }
 
   pause(): void {
     this.isPaused = true;
-    this.emit("pause");
+    this.emit("queue_pause");
     this.log("info", "Job queue paused");
   }
 
   resume(): void {
     this.isPaused = false;
-    this.emit("resume");
+    this.emit("queue_resume");
     this.log("info", "Job queue resumed");
   }
 
   private async processJobs(): Promise<void> {
-    if (this.isPaused || this.activeJobs >= this.concurrency) return;
+    if (this.isPaused || this.activeJobs >= this.concurrency || !this._isRunning)
+      return;
+
+    const jobsToProcess = this.concurrency - this.activeJobs;
+    if (jobsToProcess <= 0) return;
 
     const connection = await this.pool.getConnection();
     try {
@@ -293,7 +316,7 @@ export class TiQueue extends EventEmitter {
         LIMIT ?
         FOR UPDATE SKIP LOCKED
       `,
-        [this.queueName, this.concurrency - this.activeJobs]
+        [this.queueName, jobsToProcess]
       );
       const jobs = _jobs as Job[];
       for (const job of jobs) {
@@ -307,27 +330,31 @@ export class TiQueue extends EventEmitter {
 
       for (const job of jobs) {
         this.activeJobs++;
-        this.emit("start", job);
+        this.emit("job_start", job);
         this.log(
           "info",
           `Starting job ${job.jobId} in queue ${this.queueName}`
         );
-        this.processJob(job);
+        await this.processJob(job);
       }
     } catch (error) {
-      await connection.rollback();
+      if (connection) {
+        await connection.rollback();
+      }
       this.log("error", "Error processing jobs:", error);
       this.emit("error", error);
     } finally {
-      connection.release();
+      if (connection) {
+        connection.release();
+      }
     }
   }
 
-  private processJob(job: Job): void {
+  private async processJob(job: Job): Promise<void> {
     if (this.useSeparateProcess) {
       this.processJobInSeparateProcess(job);
     } else {
-      this.processJobInline(job);
+      await this.processJobInline(job);
     }
   }
 
@@ -409,7 +436,7 @@ export class TiQueue extends EventEmitter {
     ]);
     job.status = "completed";
     this.log("info", `Job ${job.jobId} completed successfully`);
-    this.emit("completed", job, result);
+    this.emit("job_completed", job, result);
   }
 
   private async handleFailedJob(job: Job, error: Error): Promise<void> {
@@ -431,7 +458,7 @@ export class TiQueue extends EventEmitter {
             "info",
             `Job ${job.jobId} failed and scheduled for retry at ${nextRetryAt}`
           );
-          this.emit("retry", job, error);
+          this.emit("job_retry", job, error);
         } else {
           // Job has exhausted all attempts and retries
           await this.pool.query(
@@ -440,9 +467,9 @@ export class TiQueue extends EventEmitter {
           );
           this.log(
             "warn",
-            `Job ${job.jobId} failed after ${job.attempts} attempts and ${job.retryOnFailAttempts} retries`
+            `Job ${job.jobId} from '${job.queueName}' failed after ${job.attempts} attempts and ${job.retryOnFailAttempts} retries`
           );
-          this.emit("failed", job, error);
+          this.emit("job_failed", job, error);
         }
       } else {
         // Job has not exhausted its initial attempts, reschedule it
@@ -451,35 +478,113 @@ export class TiQueue extends EventEmitter {
           [this.parseTime(job.retryOnFailInterval) / 1000, job.id]
         );
         this.log("info", `Job ${job.jobId} failed and rescheduled for retry`);
-        this.emit("retry", job, error);
+        this.emit("job_retry", job, error);
       }
     } catch (err) {
       this.log("error", `Error handling failed job ${job.jobId}:`, err);
       this.emit("error", err);
     }
   }
-  async getJobStatus(jobId: number): Promise<Job | null> {
+  private async handleShutdownSignal() {
+    this.log(
+      "info",
+      "Shutdown signal received. Initiating graceful shutdown..."
+    );
+    try {
+      await this.shutdown();
+      process.exit(0);
+    } catch (error) {
+      this.log("error", "Error during shutdown:", error);
+      process.exit(1);
+    }
+  }
+  async shutdown(timeout: number = 5000): Promise<void> {
+    if (this.isShuttingDown) {
+      this.log("warn", "Shutdown already in progress");
+      return;
+    }
+
+    this.isShuttingDown = true;
+    this.log("info", "Initiating shutdown process");
+
+    // Stop accepting new jobs
+    this.stop();
+
+    // Wait for active jobs to complete (with timeout)
+    const shutdownPromise = new Promise<void>((resolve) => {
+      const checkActiveJobs = setInterval(() => {
+        if (this.activeJobs === 0) {
+          clearInterval(checkActiveJobs);
+          resolve();
+        }
+      }, 100);
+    });
+
+    try {
+      await Promise.race([
+        shutdownPromise,
+        new Promise((_, reject) =>
+          setTimeout(() => reject(new Error("Shutdown timeout")), timeout)
+        ),
+      ]);
+
+      // Gracefully shutdown workers
+      await Promise.all(
+        this.workers.map(
+          async (worker) => await this.gracefullyShutdownWorker(worker)
+        )
+      );
+
+      // Close database connection
+      if (this.pool) await this.pool.end();
+
+      this.log("info", "Queue shut down successfully");
+    } catch (error) {
+      this.log("error", "Error during shutdown:", error);
+      // Force shutdown if timeout occurs
+      this.workers.forEach((worker) => worker.kill());
+      if (this.pool) await this.pool.end();
+    }
+  }
+
+  private async gracefullyShutdownWorker(worker: ChildProcess): Promise<void> {
+    return new Promise((resolve) => {
+      worker.send("shutdown");
+      worker.on("exit", () => {
+        resolve();
+      });
+      // Fallback in case the worker doesn't exit on its own
+      setTimeout(() => {
+        worker.kill();
+        resolve();
+      }, 5000);
+    });
+  }
+
+  async getJobStatus(jobId: number | string): Promise<Job | null> {
     const [_jobs] = await this.pool.query(
-      "SELECT * FROM jobs WHERE id = ? AND queueName = ?",
-      [jobId, this.queueName]
+      "SELECT * FROM jobs WHERE id = ? OR jobId = ? AND queueName = ?",
+      [jobId, jobId, this.queueName]
     );
     const jobs = _jobs as Job[];
     return jobs[0] || null;
   }
 
-  async cancelJob(jobId: number): Promise<boolean> {
+  async cancelJob(jobId: number | string): Promise<boolean> {
     const [result] = await this.pool.query<mysql.ResultSetHeader>(
-      'UPDATE jobs SET status = "failed" WHERE id = ? AND queueName = ? AND status IN ("queued", "processing")',
-      [jobId, this.queueName]
+      'UPDATE jobs SET status = "failed" WHERE (id = ? OR jobId = ?)  AND queueName = ? AND status IN ("queued", "processing")',
+      [jobId, jobId, this.queueName]
     );
+    this.emit("job_cancelled", jobId);
     return result.affectedRows > 0;
   }
 
-  async retryJob(jobId: number): Promise<boolean> {
+  async retryJob(jobId: number | string): Promise<boolean> {
     const [result] = await this.pool.query<mysql.ResultSetHeader>(
-      'UPDATE jobs SET status = "queued", attempts = 0, runAt = NOW() WHERE id = ? AND queueName = ? AND status = "failed"',
-      [jobId, this.queueName]
+      'UPDATE jobs SET status = "queued", attempts = 0,retryOnFailAttempts = 0, runAt = NOW() WHERE (id = ? OR jobId = ?)  AND queueName = ? AND status = "failed"',
+      [jobId, jobId, this.queueName]
     );
+    this.emit("job_retry", jobId);
     return result.affectedRows > 0;
   }
 
@@ -529,26 +634,28 @@ export class TiQueue extends EventEmitter {
 
   private log(level: string, message: string, meta?: any): void {
     if (this.logger) {
-      this.logger.log(level, message, meta);
+      this.logger.log(
+        level,
+        `Time:${new Date().toLocaleString()}: - ${message}`,
+        meta
+      );
     }
   }
 
   private setupCronJob(jobId: number, cronExpression: string): void {
-    const job = new CronJob(cronExpression, () => this.triggerCronJob(jobId));
-    this.cronJobs.set(jobId, job);
-    job.start();
+    const cronJob = new CronJob(
+      cronExpression,
+      async () => await this.triggerCronJob(jobId)
+    );
+    this.cronJobs.set(jobId, cronJob);
+    cronJob.start();
   }
 
   private async triggerCronJob(jobId: number): Promise<void> {
     await this.pool.query(
-      'UPDATE jobs SET runAt = NOW(), attempts = 0 WHERE id = ? AND queueName = ? AND status != "processing"',
+      'UPDATE jobs SET runAt = NOW(), attempts = 0,retryOnFailAttempts = 0, WHERE id = ? AND queueName = ? AND status != "processing"',
       [jobId, this.queueName]
     );
-  }
-
-  async shutdown(): Promise<void> {
-    this.stop();
-    await this.pool.end();
   }
 }
 
