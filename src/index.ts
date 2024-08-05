@@ -265,7 +265,7 @@ export class TiQueue extends EventEmitter {
         this.emit("job_start", job);
         this.log(
           "info",
-          `Starting job ${job.jobId} in queue ${this.queueName}`
+          `Starting job '${job.jobId}' in queue '${this.queueName}'`
         );
         await this.processJob(job);
       }
@@ -294,7 +294,7 @@ export class TiQueue extends EventEmitter {
     try {
       const handler = this.jobHandlers.get(this.queueName);
       if (!handler) {
-        throw new Error(`No handler registered for queue ${this.queueName}`);
+        throw new Error(`No handler registered for queue '${this.queueName}'`);
       }
       const result = await handler(job);
       await this.completeJob(job, result);
@@ -373,22 +373,24 @@ export class TiQueue extends EventEmitter {
 
   private async handleFailedJob(job: Job, error: Error): Promise<void> {
     try {
-      if (job.attempts >= job.maxAttempts) {
+      console.log({ att: job.attempts, maxAtt: job.maxAttempts });
+
+      if (job.attempts > job.maxAttempts) {
         if (
           job.retryOnFail &&
           job.retryOnFailAttempts < job.maxRetryOnFailAttempts
         ) {
           // Job has exhausted its initial attempts, but can still be retried
-          const nextRetryAt = new Date(
-            Date.now() + this.parseTime(job.retryOnFailInterval)
-          );
+          const nextRetryAt = this.parseTime(job.retryOnFailInterval) / 1000;
           await this.pool.query(
-            'UPDATE jobs SET status = "queued", attempts = 0, runAt = ?, retryOnFailAttempts = retryOnFailAttempts + 1 WHERE id = ?',
+            'UPDATE jobs SET status = "queued", attempts = 0, runAt = NOW() + INTERVAL ?, retryOnFailAttempts = retryOnFailAttempts + 1 WHERE id = ?',
             [nextRetryAt, job.id]
           );
           this.log(
             "info",
-            `Job ${job.jobId} failed and scheduled for retry at ${nextRetryAt}`
+            `Job ${job.jobId} failed and scheduled for retry at ${ms(
+              nextRetryAt
+            )}`
           );
           this.emit("job_retry", job, error);
         } else {
@@ -406,7 +408,7 @@ export class TiQueue extends EventEmitter {
       } else {
         // Job has not exhausted its initial attempts, reschedule it
         await this.pool.query(
-          'UPDATE jobs SET status = "queued", runAt = NOW() + INTERVAL ? SECOND WHERE id = ?',
+          'UPDATE jobs SET status = "queued", runAt = NOW() + INTERVAL ? SECOND, priority = priority + 1 WHERE id = ?',
           [this.parseTime(job.retryOnFailInterval) / 1000, job.id]
         );
         this.log("info", `Job ${job.jobId} failed and rescheduled for retry`);
@@ -563,7 +565,14 @@ export class TiQueue extends EventEmitter {
       [this.queueName, cutoffDate]
     );
   }
-
+  async deleteAllJobs() {
+    try {
+      await this.pool.query("DELETE FROM jobs");
+      this.log("info", "deleted all jobs");
+    } catch (error) {
+      this.log("info", "Something went wrong, couldn't delete jobs...");
+    }
+  }
   private log(level: string, message: string, meta?: any): void {
     if (this.logger) {
       this.logger.log(
