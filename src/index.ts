@@ -3,114 +3,42 @@ import { EventEmitter } from "events";
 import * as mysql from "mysql2/promise";
 import { fork, ChildProcess } from "child_process";
 import { CronJob } from "cron";
-import * as winston from "winston";
 import { v4 as uuid } from "uuid";
 import isEmpty from "just-is-empty";
+import { logger, Logger } from "./logger";
+import { Job, JobOptions, QueueOptions } from "./types";
 
-export interface Job<P = any> {
-  id: number;
-  queueName: string;
-  payload: P | null;
-  status: "queued" | "processing" | "completed" | "failed";
-  runAt: Date;
-  priority: number;
-  attempts: number;
-  jobId: string;
-  delay: string;
-  maxAttempts: number;
-  retryOnFail: boolean;
-  retryOnFailInterval: string;
-  maxRetryOnFailAttempts: number;
-  retryOnFailAttempts: number;
-  cron: string;
-}
-
-export interface JobOptions {
-  /**
-   * Set a custom id for the job (not more than 36 characters), e.g uuid
-   */
-  jobId?: string;
-  /**
-   * The delay before the job starts in this format 1s, 2m, 1h
-   */
-  delay?: string;
-
-  priority?: number;
-  /**
-   * The maximum number of attempts to run the job, default 3
-   */
-  maxAttempts?: number;
-  /**
-   * Whether to retry the job when it fails, default true
-   */
-  retryOnFail?: boolean;
-  /**
-   * The maximum number of retry attempts when the job fails, default is 3
-   */
-  maxRetryOnFailAttempts?: number;
-  /**
-   * The interval between retry attempts when the job fails, default is 5s
-   */
-  retryOnFailInterval?: string;
-
-  /**
-   * The cron expression for scheduling the job, e.g. "0 0 * * *" for every midnight
-   */
-  cron?: string;
-}
-
-export interface QueueOptions {
-  /**
-   * How frequently should the jobs be checked,  (default is 5s)
-   */
-  pollingInterval?: string;
-  /**
-   * How many concurrent jobs to run at once,(default is 5)
-   */
-  concurrency?: number;
-  /**
-   * Whether to automatically start the job queue, (default is true)
-   */
-  autoStart?: boolean;
-  /**
-   * Whether to use a separate process for running jobs, (default is false)
-   */
-  useSeparateProcess?: boolean;
-  /**
-   * The path to the worker file if useSeparateProcess is true
-   * */
-  workerFile?: string;
-  /**
-   * Whether to enable logging to the stdout and a file or not.
-   */
-  logging?: {
-    enabled: boolean;
-
-    level?: string;
-    /**
-     * Logs filename, default is job_queue.log
-     */
-    filename?: string;
-  };
-}
 export class TiQueue extends EventEmitter {
   private pool: mysql.Pool;
   private pollingInterval: number;
   private concurrency: number;
-  public isRunning:boolean = false;
+  public isRunning: boolean = false;
   private _isRunning: boolean = false;
   private isPaused: boolean = false;
   private isShuttingDown: boolean = false;
   private activeJobs: number = 0;
   private cronJobs: Map<number, CronJob> = new Map();
   private workers: ChildProcess[] = [];
-  private logger?: winston.Logger;
+  private logger?: Logger;
   private useSeparateProcess: boolean;
   private workerFile?: string;
   private pollIntervalId?: NodeJS.Timeout;
   private queueName: string;
   private jobHandlers: Map<string, (job: Job) => Promise<any>> = new Map();
   private initPromise: Promise<void>;
+  /**
+   * Constructs a new instance of the `TiQueue` class.
+   *
+   * @param queueName - The name of the queue.
+   * @param dbConfigOrPool - The MySQL database configuration or a pre-existing MySQL connection pool.
+   * @param options - Optional configuration options for the queue.
+   *   - `pollingInterval` - The interval at which the queue should poll for new jobs, in milliseconds.
+   *   - `concurrency` - The maximum number of concurrent jobs the queue can process.
+   *   - `useSeparateProcess` - Whether to use a separate process for job processing.
+   *   - `workerFile` - The file path of the worker script to use for job processing.
+   *   - `logging` - Configuration options for logging, including `enabled`, `level`, and `filename`.
+   *   - `autoStart` - Whether to automatically start the queue when the instance is created.
+   */
   constructor(
     queueName: string,
     dbConfigOrPool: mysql.PoolOptions | mysql.Pool,
@@ -127,16 +55,12 @@ export class TiQueue extends EventEmitter {
     this.workerFile = options.workerFile;
 
     if (options.logging && options.logging.enabled) {
-      this.logger = winston.createLogger({
-        level: options.logging.level || "info",
-        format: winston.format.simple(),
-        transports: [
-          new winston.transports.Console(),
-          new winston.transports.File({
-            filename: options.logging.filename || `${this.queueName}.log`,
-          }),
-        ],
-      });
+      const loggerOpt = {
+        queueName: this.queueName,
+        level: options.logging.level,
+        filename: options.logging.filename,
+      };
+      this.logger = logger(loggerOpt);
     }
 
     this.initPromise = (async () => await this.init())();
@@ -149,13 +73,17 @@ export class TiQueue extends EventEmitter {
     process.on("SIGINT", this.handleShutdownSignal.bind(this));
     process.on("SIGTERM", this.handleShutdownSignal.bind(this));
   }
-  private set queueStatus({isRunning,isPaused}:{isRunning:boolean,isPaused:boolean}){
-
-    this.emit("statusChange", {isRunning,isPaused});
-
+  private set queueStatus({
+    isRunning,
+    isPaused,
+  }: {
+    isRunning: boolean;
+    isPaused: boolean;
+  }) {
+    this.emit("statusChange", { isRunning, isPaused });
   }
-  get queueStatus(){
-    return {isRunning: this._isRunning, isPaused: this.isPaused};
+  get queueStatus() {
+    return { isRunning: this._isRunning, isPaused: this.isPaused };
   }
   private isMySQLPool(obj: any) {
     return (
@@ -298,7 +226,11 @@ export class TiQueue extends EventEmitter {
   }
 
   private async processJobs(): Promise<void> {
-    if (this.isPaused || this.activeJobs >= this.concurrency || !this._isRunning)
+    if (
+      this.isPaused ||
+      this.activeJobs >= this.concurrency ||
+      !this._isRunning
+    )
       return;
 
     const jobsToProcess = this.concurrency - this.activeJobs;
@@ -436,7 +368,7 @@ export class TiQueue extends EventEmitter {
     ]);
     job.status = "completed";
     this.log("info", `Job ${job.jobId} completed successfully`);
-    this.emit("job_completed", job, result);
+    this.emit("job_complete", job, result);
   }
 
   private async handleFailedJob(job: Job, error: Error): Promise<void> {
@@ -469,7 +401,7 @@ export class TiQueue extends EventEmitter {
             "warn",
             `Job ${job.jobId} from '${job.queueName}' failed after ${job.attempts} attempts and ${job.retryOnFailAttempts} retries`
           );
-          this.emit("job_failed", job, error);
+          this.emit("job_fail", job, error);
         }
       } else {
         // Job has not exhausted its initial attempts, reschedule it
@@ -575,7 +507,7 @@ export class TiQueue extends EventEmitter {
       'UPDATE jobs SET status = "failed" WHERE (id = ? OR jobId = ?)  AND queueName = ? AND status IN ("queued", "processing")',
       [jobId, jobId, this.queueName]
     );
-    this.emit("job_cancelled", jobId);
+    this.emit("job_cancel", jobId);
     return result.affectedRows > 0;
   }
 
